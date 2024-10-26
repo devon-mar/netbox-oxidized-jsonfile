@@ -242,6 +242,7 @@ fn run(config: Config) {
 }
 
 #[derive(Parser)]
+#[command(version = env!("VERSION_STRING"))]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
