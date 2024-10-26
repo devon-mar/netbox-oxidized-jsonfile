@@ -5,20 +5,24 @@ use serde::{Deserialize, Serialize};
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator::Signals;
 use std::fs::{read_to_string, File};
-use std::io::{self, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufReader, BufWriter, Write};
+use std::path::PathBuf;
 use std::process::exit;
-use std::thread;
 use std::time::Duration;
+use std::{env, thread};
 use thiserror::Error;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Error)]
 enum ConfigError {
-    #[error("error opening config file: {0}")]
-    File(#[from] io::Error),
-    #[error("error parsing config file: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error("environment variable {0} not set: {1}")]
+    Env(&'static str, std::env::VarError),
+    #[error("{0}: ")]
+    Parse(&'static str, String),
+    #[error("this should never happen: {0}")]
+    Infallible(#[from] std::convert::Infallible),
+    #[error("environment parsing value as int: {0}")]
+    IntParse(#[from] std::num::ParseIntError),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -41,31 +45,26 @@ struct NetBoxDevice {
     custom_field_data: NetBoxDeviceCustomFieldData,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct ConfigGenerator {
     netbox_url: String,
+    netbox_token_file: PathBuf,
     username_file: PathBuf,
     password_file: PathBuf,
-    netbox_token_file: PathBuf,
     output_file: PathBuf,
     oxidized_url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct Config {
     config_interval_s: u64,
-    #[serde(flatten)]
-    config_generator: ConfigGenerator,
 }
 
 impl Config {
-    fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-
-        let config = serde_json::from_reader(reader)?;
-
-        Ok(config)
+    fn from_env() -> Result<Self, ConfigError> {
+        Ok(Config {
+            config_interval_s: read_env_parse("NB_OXIDIZED_CONFIG_INTERVAL_S")?,
+        })
     }
 }
 
@@ -85,7 +84,28 @@ enum Error {
     OxidizedReload(Box<ureq::Error>),
 }
 
+fn read_env_parse<T: std::str::FromStr>(var: &'static str) -> Result<T, ConfigError>
+where
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    env::var(var)
+        .map_err(|err| ConfigError::Env(var, err))?
+        .parse()
+        .map_err(|err: T::Err| ConfigError::Parse(var, err.to_string()))
+}
+
 impl ConfigGenerator {
+    fn from_env() -> Result<Self, ConfigError> {
+        Ok(ConfigGenerator {
+            netbox_url: read_env_parse("NB_OXIDIZED_NETBOX_URL")?,
+            netbox_token_file: read_env_parse("NB_OXIDIZED_NETBOX_TOKEN_FILE")?,
+            username_file: read_env_parse("NB_OXIDIZED_USERNAME_FILE")?,
+            password_file: read_env_parse("NB_OXIDIZED_PASSWORD_FILE")?,
+            output_file: read_env_parse("NB_OXIDIZED_OUTPUT_FILE")?,
+            oxidized_url: read_env_parse("NB_OXIDIZED_OXIDIZED_URL")?,
+        })
+    }
+
     fn update_oxidized(&self) -> Result<(), Error> {
         ureq::post(&self.oxidized_url)
             .timeout(Duration::from_secs(10))
@@ -176,9 +196,7 @@ fn sig_channel(tx: Sender<i32>) {
     }
 }
 
-fn run(config: Config) {
-    let cg = config.config_generator;
-
+fn run(config: Config, cg: ConfigGenerator) {
     let (notify_tx, notify_rx) = crossbeam_channel::bounded(1);
     let mut debouncer =
         new_debouncer(Duration::from_secs(10), notify_tx).expect("error creating notify debouncer");
@@ -258,20 +276,19 @@ enum Commands {
     Run,
 }
 
-fn main() {
+fn main() -> Result<(), ConfigError> {
     let args = Cli::parse();
     tracing_subscriber::fmt()
         .with_max_level(args.log_level)
         .init();
 
-    match Config::from_file(args.config) {
-        Ok(cg) => match args.command {
-            Commands::StartupProbe => startup_probe(cg.config_generator),
-            Commands::Run => run(cg),
-        },
-        Err(err) => {
-            error!(err = %err, "error reading config");
-            exit(1);
-        }
+    let config = Config::from_env()?;
+    let cg = ConfigGenerator::from_env()?;
+
+    match args.command {
+        Commands::StartupProbe => startup_probe(cg),
+        Commands::Run => run(config, cg),
     }
+
+    Ok(())
 }
