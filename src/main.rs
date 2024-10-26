@@ -248,6 +248,8 @@ struct Cli {
     command: Commands,
     #[arg(long, default_value = "config.json")]
     config: PathBuf,
+    #[arg(long, default_value = "info")]
+    log_level: tracing::Level,
 }
 
 #[derive(Subcommand)]
@@ -257,9 +259,11 @@ enum Commands {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
-
     let args = Cli::parse();
+    tracing_subscriber::fmt()
+        .with_max_level(args.log_level)
+        .init();
+
     match Config::from_file(args.config) {
         Ok(cg) => match args.command {
             Commands::StartupProbe => startup_probe(cg.config_generator),
