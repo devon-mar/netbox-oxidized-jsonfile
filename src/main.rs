@@ -107,7 +107,7 @@ impl ConfigGenerator {
     }
 
     fn update_oxidized(&self) -> Result<(), Error> {
-        ureq::post(&self.oxidized_url)
+        ureq::get(&self.oxidized_url)
             .timeout(Duration::from_secs(10))
             .call()
             .map_err(|e| Error::OxidizedReload(Box::new(e)))?;
