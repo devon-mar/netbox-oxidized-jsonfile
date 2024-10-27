@@ -1,9 +1,11 @@
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use crossbeam_channel::{select, Sender};
 use notify_debouncer_mini::new_debouncer;
 use serde::{Deserialize, Serialize};
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator::Signals;
+use std::fmt::Debug;
 use std::fs::{read_to_string, File};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -11,7 +13,7 @@ use std::process::exit;
 use std::time::Duration;
 use std::{env, thread};
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Error)]
 enum ConfigError {
@@ -39,6 +41,11 @@ struct NetBoxDeviceCustomFieldData {
 }
 
 #[derive(Deserialize)]
+struct NetBoxResult {
+    count: u32,
+}
+
+#[derive(Deserialize)]
 struct NetBoxDevice {
     #[serde(rename = "platform__slug")]
     platform: String,
@@ -48,11 +55,13 @@ struct NetBoxDevice {
 #[derive(Debug)]
 struct ConfigGenerator {
     netbox_url: String,
+    netbox_object_changes_url: String,
     netbox_token_file: PathBuf,
     username_file: PathBuf,
     password_file: PathBuf,
     output_file: PathBuf,
     oxidized_url: String,
+    last_config: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -98,11 +107,13 @@ impl ConfigGenerator {
     fn from_env() -> Result<Self, ConfigError> {
         Ok(ConfigGenerator {
             netbox_url: read_env_parse("NB_OXIDIZED_NETBOX_URL")?,
+            netbox_object_changes_url: read_env_parse("NB_OXIDIZED_NETBOX_OBJECT_CHANGES_URL")?,
             netbox_token_file: read_env_parse("NB_OXIDIZED_NETBOX_TOKEN_FILE")?,
             username_file: read_env_parse("NB_OXIDIZED_USERNAME_FILE")?,
             password_file: read_env_parse("NB_OXIDIZED_PASSWORD_FILE")?,
             output_file: read_env_parse("NB_OXIDIZED_OUTPUT_FILE")?,
             oxidized_url: read_env_parse("NB_OXIDIZED_OXIDIZED_URL")?,
+            last_config: Utc::now(),
         })
     }
 
@@ -115,7 +126,10 @@ impl ConfigGenerator {
     }
 
     fn get_netbox_devices(&self, netbox_token: &str) -> Result<Vec<NetBoxDevice>, Error> {
-        ureq::get(&self.netbox_url)
+        ureq::get(&self.netbox_object_changes_url)
+            .query("time_after", &self.last_config.format("%+").to_string())
+            .query("brief", "1")
+            .query("limit", "1")
             .set("Authorization", &("Token ".to_string() + netbox_token))
             .timeout(Duration::from_secs(20))
             .call()
@@ -149,12 +163,43 @@ impl ConfigGenerator {
         Ok(())
     }
 
+    fn netbox_changed(&self, netbox_token: &str) -> bool {
+        let resp = ureq::get(&self.netbox_url)
+            .set("Authorization", &("Token ".to_string() + netbox_token))
+            .timeout(Duration::from_secs(20))
+            .call()
+            .map_err(|e| Error::NetBox(Box::new(e)));
+
+        match resp {
+            Ok(resp) => match resp.into_json::<NetBoxResult>() {
+                Ok(result) => result.count > 0,
+                Err(err) => {
+                    error!(err = ?err, "error unmarshalling NetBox object-changes");
+                    false
+                }
+            },
+            Err(err) => {
+                error!(err = ?err, "error getting NetBox object-changes");
+                false
+            }
+        }
+    }
+
     // Returns Ok(device count) on success or error.
-    fn generate_config(&self, oxidized_reload: bool) -> Result<usize, Error> {
+    fn generate_config(
+        &mut self,
+        oxidized_reload: bool,
+        force: bool,
+    ) -> Result<Option<usize>, Error> {
         // read all secrets
         let netbox_token = read_to_string(&self.netbox_token_file).map_err(Error::SecretRead)?;
         let username = read_to_string(&self.username_file).map_err(Error::SecretRead)?;
         let password = read_to_string(&self.password_file).map_err(Error::SecretRead)?;
+
+        if !force && self.netbox_changed(&netbox_token) {
+            debug!(last_config = %self.last_config, "NetBox has not changed");
+            return Ok(None);
+        }
 
         let netbox_devices = self.get_netbox_devices(&netbox_token)?;
         let device_count = netbox_devices.len();
@@ -168,7 +213,9 @@ impl ConfigGenerator {
             self.update_oxidized()?;
         }
 
-        Ok(device_count)
+        self.last_config = Utc::now();
+
+        Ok(Some(device_count))
     }
 }
 
@@ -196,7 +243,7 @@ fn sig_channel(tx: Sender<i32>) {
     }
 }
 
-fn run(config: Config, cg: ConfigGenerator) {
+fn run(config: Config, mut cg: ConfigGenerator) {
     let (notify_tx, notify_rx) = crossbeam_channel::bounded(1);
     let mut debouncer =
         new_debouncer(Duration::from_secs(10), notify_tx).expect("error creating notify debouncer");
@@ -210,7 +257,7 @@ fn run(config: Config, cg: ConfigGenerator) {
 
     // Initial config
     info!("generating initial config");
-    match cg.generate_config(false) {
+    match cg.generate_config(false, true) {
         Ok(count) => info!(devices = count, "initial config generated successfully"),
         Err(err) => {
             error!(err = %err, "error generating initial config");
@@ -221,8 +268,9 @@ fn run(config: Config, cg: ConfigGenerator) {
     let (sig_tx, sig_rx) = crossbeam_channel::bounded(1);
     thread::spawn(move || sig_channel(sig_tx));
 
-    let generate_config = || match cg.generate_config(true) {
-        Ok(count) => info!(devices = count, "new config generated successfully"),
+    let mut generate_config = || match cg.generate_config(true, false) {
+        Ok(None) => debug!("no NetBox changes"),
+        Ok(Some(count)) => info!(devices = count, "new config generated successfully"),
         Err(err) => error!(err = %err, "error generating config"),
     };
 
