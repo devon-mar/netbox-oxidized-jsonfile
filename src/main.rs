@@ -127,9 +127,6 @@ impl ConfigGenerator {
 
     fn get_netbox_devices(&self, netbox_token: &str) -> Result<Vec<NetBoxDevice>, Error> {
         ureq::get(&self.netbox_url)
-            .query("time_after", &self.last_config.format("%+").to_string())
-            .query("brief", "1")
-            .query("limit", "1")
             .set("Authorization", &("Token ".to_string() + netbox_token))
             .timeout(Duration::from_secs(20))
             .call()
@@ -165,6 +162,9 @@ impl ConfigGenerator {
 
     fn netbox_changed(&self, netbox_token: &str) -> bool {
         let resp = ureq::get(&self.netbox_object_changes_url)
+            .query("time_after", &self.last_config.format("%+").to_string())
+            .query("brief", "1")
+            .query("limit", "1")
             .set("Authorization", &("Token ".to_string() + netbox_token))
             .timeout(Duration::from_secs(20))
             .call()
