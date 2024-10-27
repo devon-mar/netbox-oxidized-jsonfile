@@ -196,7 +196,7 @@ impl ConfigGenerator {
         let username = read_to_string(&self.username_file).map_err(Error::SecretRead)?;
         let password = read_to_string(&self.password_file).map_err(Error::SecretRead)?;
 
-        if !force && self.netbox_changed(&netbox_token) {
+        if !force && !self.netbox_changed(&netbox_token) {
             debug!(last_config = %self.last_config, "NetBox has not changed");
             return Ok(None);
         }
@@ -268,7 +268,7 @@ fn run(config: Config, mut cg: ConfigGenerator) {
     let (sig_tx, sig_rx) = crossbeam_channel::bounded(1);
     thread::spawn(move || sig_channel(sig_tx));
 
-    let mut generate_config = || match cg.generate_config(true, false) {
+    let mut generate_config = |force: bool| match cg.generate_config(true, force) {
         Ok(None) => debug!("no NetBox changes"),
         Ok(Some(count)) => info!(devices = count, "new config generated successfully"),
         Err(err) => error!(err = %err, "error generating config"),
@@ -292,7 +292,7 @@ fn run(config: Config, mut cg: ConfigGenerator) {
                 }
                 Ok(Ok(_)) => {
                     info!("password change: generating new config");
-                    generate_config();
+                    generate_config(true);
                 }
                 Err(err) => {
                     error!(err = ?err, "error receiving from channel");
@@ -301,7 +301,7 @@ fn run(config: Config, mut cg: ConfigGenerator) {
             },
         default(Duration::from_secs(config.config_interval_s)) => {
             info!("schedule: generating new config");
-            generate_config();
+            generate_config(false);
         }
         }
     }
